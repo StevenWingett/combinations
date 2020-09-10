@@ -1,0 +1,306 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX ":sys_wait_h";    #for nonblocking read
+use POSIX;
+use Carp;
+use FindBin '$Bin';
+use lib $Bin;
+use hicup_module;
+use hicup_module qw(hashVal outdirFileNamer get_csome_position);
+
+use Data::Dumper;
+
+###################################################################################
+###################################################################################
+##This file is Copyright (C) 2020, Steven Wingett (steven.wingett@babraham.ac.uk)##
+##                                                                               ##
+##                                                                               ##
+##This file is part of HiCUP.                                                    ##
+##                                                                               ##
+##HiCUP is free software: you can redistribute it and/or modify                  ##
+##it under the terms of the GNU General Public License as published by           ##
+##the Free Software Foundation, either version 3 of the License, or              ##
+##(at your option) any later version.                                            ##
+##                                                                               ##
+##HiCUP is distributed in the hope that it will be useful,                       ##
+##but WITHOUT ANY WARRANTY; without even the implied warranty of                 ##
+##MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                  ##
+##GNU General Public License for more details.                                   ##
+##                                                                               ##
+##You should have received a copy of the GNU General Public License              ##
+##along with HiCUP.  If not, see <http://www.gnu.org/licenses/>.                 ##
+###################################################################################
+###################################################################################
+
+
+#Option variables
+my %config = (
+    #digest      => '',
+    samtools    => '',
+    zip         => ''
+);
+
+##########################################################
+#Get user-supplied parameters
+my $config_result = GetOptions(
+    #"digest=s"    =>    \$config{digest},
+    "samtools=s" =>     \$config{samtools},
+    "zip"           =>  \$config{zip}
+);
+
+die "Could not parse options.\n" unless ($config_result);
+
+
+my @files = deduplicate_array(@ARGV);    #Files to be processed
+die "Please specify files to be pre-filtered\n" unless (@files);
+#die "Please specify a digest file\n" unless ($config{digest});
+$config{zip} = 1;   #Set to zip
+check_dependencies();   #Check SAMtools locations
+
+#Generate summary file
+my @summary_categories = ('Input_Reads', 'Input_Ditags', 'Ditag_Groups', 'Novel_Self_Ditag', 
+                            'Novel_Fragment_Fragment_Duplicates', 'Allowed_Reads', 'Allowed_Ditags');
+
+my %summary_counter;
+my $summary_header = "File\t";
+foreach my $category (@summary_categories){    #Initialise summary counter
+    $summary_counter{$category} = 0;   #Initialise
+    $summary_header .= $category . "\t";
+}
+$summary_header =~ s/\t$/\n/;    #Swap trailing tab for newline
+
+my $summary_file = 'hicup_prefilter_summary.txt';
+open(SUMMARY, '>', $summary_file) or die "Could not write to '$summary_file' : $!";
+print SUMMARY $summary_header;
+
+print "Prefiltering fragments fragments\n";
+
+###################
+#Process digest file
+#print "Reading digest file $config{digest}\n";
+
+# if ( $config{digest} =~ /.*\.gz$/ ) {
+#     open( DIGEST, "zcat $config{digest} |" ) or die "Cannot open file: $!";
+# } else {
+#     open( DIGEST, $config{digest} ) or die "Cannot open file: $!";
+# }
+
+
+# my %digest_fragments;   # %{csome \t tokb_region}->{frist_base} = $last_base\t$fragment_number
+
+# while (<DIGEST>) {
+#     unless (/\w+\t\d+\t\d+\t\d+/) {
+#         next;
+#     }
+#     my $chromosome_name            = ( split /\t/ )[0];
+#     my $first_base                 = ( split /\t/ )[1];
+#     my $last_base                  = ( split /\t/ )[2];
+#     my $fragment_number            = ( split /\t/ )[3];
+#     my $ten_kb_region              = ceil( $first_base / 10000 );
+#     my $fragment_end_ten_kb_region = ceil( $last_base / 10000 );
+
+#     do {
+#         $digest_fragments{"$chromosome_name\t$ten_kb_region"}{$first_base} = "$last_base\t$fragment_number";
+#         $ten_kb_region++;
+#     } while ( $ten_kb_region <= $fragment_end_ten_kb_region );
+# }
+ 
+#Forward reads will map to the front of a restriction fragment, whereas reverse reads will map to the end.
+#Consequently we need to relate end positions to a given fragment.
+#The code below creates a "lookup" hash with fragment end positions as keys and first base pair positions as values.
+#foreach my $key ( keys %digest_fragments ) {
+#    my $chromosome = ( split( /\t/, $key ) )[0];
+#    my $first_base = ( split( /\t/, $key ) )[1];
+#    my $last_base  = ( split( /\t/, $digest_fragments{$key} ) )[0];
+#    $last_first_bases{"$chromosome\t$last_base"} = "$chromosome\t$first_base";
+#}
+#close DIGEST or die "Could not close filehandle on '$config{digest}' : $!";
+
+
+####################################
+#Read in and process mapped BAM files
+foreach my $filename (@files){
+
+    print "Processing $filename\n";
+    
+    if ( $filename =~ /\.gz$/ ) {
+        open( READS, "zcat $filename |" ) or die "Couldn't read $filename : $!";
+    } elsif ( $filename =~ /\.bam$/ ) {
+        if ( $config{samtools} ) {
+            open( READS, "$config{samtools} view -h $filename |" ) or die "Couldn't read $filename: $!";
+        } else {
+            die "Cannot process BAM files - either install SAMtools to process '$filename' or only provide SAM files\n";
+        }
+    }
+
+    my $write_command;
+    $write_command  = '| samtools view -bSh 2>/dev/null - > ';
+    my $outputfilename = "$filename.prefiltered.bam";
+ 
+    open( OUT, $write_command . $outputfilename ) or die "Could not write to $outputfilename: $!";
+
+    my $previous_ditag_group_id;
+    my @grouped_ditags;
+    while (<READS>) {
+        my $read = $_;
+        chomp $read;
+
+        if($read =~ /^@/){    #Headers
+            print OUT "$read\n";
+            next;
+        }
+
+        $summary_counter{Input_Reads}++;
+        $summary_counter{Input_Ditags} += 0.5;
+
+
+        #Get the di-tag group id from the header
+        #Ditags groups should be on adjacent lines in the file
+        my ($ditag_group_id) = split(/\t/, $read);
+        $ditag_group_id = (split(/:/, $ditag_group_id))[-2];
+        $ditag_group_id = (split(/\./, $ditag_group_id))[0];
+        #print "$ditag_group_id\n";
+
+
+        if( (defined $previous_ditag_group_id) and ($ditag_group_id != $previous_ditag_group_id) ){    #A new di-tag group
+            
+            my @prefiltered_ditags = prefilter_ditag_group(@grouped_ditags);
+            #die "Internal error or file corrupted." unless ( @prefiltered_ditags);   - Is possible for this to be empty
+            foreach my $prefiltered_ditag(@prefiltered_ditags){
+                print OUT "$prefiltered_ditag\n";
+                $summary_counter{Allowed_Reads}++;
+                $summary_counter{Allowed_Ditags} += 0.5;
+            }
+            @grouped_ditags = ();    #Reset array
+            push(@grouped_ditags, $read);    #Now add current read
+        
+        } else {   #Grouping ditags
+            push(@grouped_ditags, $read);
+        }
+
+        $previous_ditag_group_id = $ditag_group_id;
+    }
+    close READS or die "Could not close filehandle on ' $filename' : $!";
+
+ 
+    #Add final ditag group in file
+    my @prefiltered_ditags = prefilter_ditag_group(@grouped_ditags);
+    #die "Internal error or file corrupted." unless (@prefiltered_ditags);   -is possible for this to be empty
+    foreach my $prefiltered_ditag(@prefiltered_ditags){
+        print OUT "$prefiltered_ditag\n";
+        $summary_counter{Allowed_Reads}++;
+        $summary_counter{Allowed_Ditags} += 0.5;
+    }
+
+    #Print summary results
+    my $summary_results_line = "$filename\t";
+    foreach my $category (@summary_categories){    #Initialis summary counter
+        $summary_results_line .= $summary_counter{$category} . "\t";
+        $summary_counter{$category} = 0;    #Reset to 0
+    }
+
+    $summary_results_line  =~ s/\t$/\n/;    #Swap trailing tab for newline
+    print SUMMARY $summary_results_line;
+}
+
+close SUMMARY or die "Could not close filehandle on '$summary_file' : $!";
+
+print "Prefiltering complete\n";
+
+exit(0);
+
+
+
+
+##########################################################################
+#Subroutines
+##########################################################################
+
+###########################
+#Subroutine "prefilter_ditag_group"
+#Takes and array of reads in the di-tag group
+#and returns the prefiltered array
+sub prefilter_ditag_group {
+    my @ditag_group = @_;
+    if((@ditag_group) % 2){
+        warn "Input ditag does not contain an even number of members:";
+        foreach my $read(@ditag_group){
+            warn "$read\n";
+        }
+        warn "This should not happen!\n";
+        return my @empty;
+    }
+
+    $summary_counter{Ditag_Groups}++;    #Declared outside of subroutine
+
+    my %interaction_tracker;  # %{fragment_fragment_interaction} = undef;
+
+    #Remove same internal fragments if they wouldn't be created by hicup
+    #Therefore, the only allowed same fragments will only be F1-R1 interactions
+    my @allowed_reads;    #Reads that pass prefiltering (paired reads in adjacent elements)
+    for (my $i=0; $i < scalar(@ditag_group); $i += 2){
+        my $j = $i + 1;
+
+        my $read1 = $ditag_group[$i];
+        my ($read1_header) = split(/\t/, $read1);
+        my $read1_fragment = (split(/:/, $read1_header))[-1];
+        my $read1_id = (split(/:/, $read1_header))[-2];
+        my $read1_classifier = (split(/\./, $read1_id))[1];
+        #print "$read1_fragment\n";
+        #print "$read1_classifier\n";
+
+        my $read2 = $ditag_group[$j];
+        my ($read2_header) = split(/\t/, $read2);
+        my $read2_fragment = (split(/:/, $read2_header))[-1];
+        my $read2_id = (split(/:/, $read2_header))[-2];
+        my $read2_classifier = (split(/\./, $read2_id))[1];
+
+        if($read1_fragment eq $read2_fragment){
+            unless( (($read1_classifier eq 'F_ORIGINAL') or ($read1_classifier eq 'F1')) and (($read2_classifier eq 'R_ORIGINAL') or ($read2_classifier eq 'R1')) ){   #This could be a normal HiCUP same-fragment
+                #print "$read1\n$read2\n\n";
+                $summary_counter{Novel_Self_Ditag}++;
+                next;    #This is a newly generated same-same fragment.  Don't use.
+            }
+        }
+
+
+        #Now fiter out duplicates of identical fragment-fragment interaction found within
+        #the same di-tag group
+        my $frag_frag_interaction;
+        if ( (  $read1_fragment cmp $read2_fragment ) == 1 ) {   #Standardised naming
+            $frag_frag_interaction = "$read2_fragment\t$read1_fragment";
+        } else {
+            $frag_frag_interaction = "$read1_fragment\t$read2_fragment";
+        }
+
+        if(exists $interaction_tracker{$frag_frag_interaction}){   #Already encountered this fragment-fragment interaction
+             $summary_counter{Novel_Fragment_Fragment_Duplicates}++;
+        } else {
+            push(@allowed_reads, ($read1, $read2));
+            $interaction_tracker{$frag_frag_interaction} = undef;   #Keep a record of this
+        }
+    }
+    #print Dumper \@allowed_reads if (scalar @allowed_reads);
+   return @allowed_reads;
+}
+
+
+
+
+
+###########################
+#Subroutine "check_dependencies"
+#Evaluates if the relevant dependencies
+#are installed, and if so stores the path
+#in the %dependencies hash_ref
+sub check_dependencies {
+
+    #Check whether SAMtools is installed
+    if ( !system "which samtools >/dev/null 2>&1" ) {
+        $config{samtools} = `which samtools`;
+    }
+    chomp $config{samtools};
+}
